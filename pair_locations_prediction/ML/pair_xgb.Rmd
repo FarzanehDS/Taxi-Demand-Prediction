@@ -1,0 +1,379 @@
+---
+jupyter:
+  jupytext:
+    text_representation:
+      extension: .Rmd
+      format_name: rmarkdown
+      format_version: '1.2'
+      jupytext_version: 1.14.7
+  kernelspec:
+    display_name: Python 3
+    name: python3
+---
+
+<!-- #region id="8UTIGpTZZlOO" -->
+# Imports
+<!-- #endregion -->
+
+```{python}
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import xgboost as xgb
+
+from sklearn.metrics import mean_absolute_error, mean_squared_error, mean_absolute_percentage_error
+from itertools import product
+```
+
+<!-- #region id="pSSMa3G2wGmF" -->
+# Configs
+<!-- #endregion -->
+
+```{python}
+INPUT_PATH = 'data/pair_labels.parquet'
+OUTPUT_PATH = 'results/pairs_xgb_predictions.parquet'
+
+RIDGE_TEST_PATH = 'ridge/pairs_ridge_test_predictions.parquet'
+RIDGE_TRAIN_PATH = 'ridge/pairs_ridge_train_predictions.parquet'
+
+START_DATE = '2023-01-01'
+END_DATE = '2023-04-30'
+
+FEATURE_LIST = [
+                'Ridge_predict',
+                
+                'Previous_week_max_demand',
+                'Previous_2week_max_demand',
+
+                'Previous_2week_demand',
+                'Previous_week_demand', 
+
+                'Previous_day_demand',
+                'Previous_2day_demand',
+                'Previous_3day_demand',
+                'Previous_4day_demand',
+                'Previous_5day_demand',
+                'Previous_6day_demand',
+                'Previous_8day_demand',
+                'Previous_9day_demand',
+                'Previous_10day_demand',
+                'Previous_11day_demand',
+                'Previous_12day_demand',
+                'Previous_13day_demand',
+
+                'Day_of_month', 
+                'Day_of_week',
+                ]
+
+VALIDATION_START_DATE = '2023-03-18'
+TEST_START_DATE = '2023-04-01'
+
+AUTO_TUNE = False
+```
+
+<!-- #region id="5eS5BQE9wGmK" -->
+# Data preparation
+
+<!-- #endregion -->
+
+<!-- #region id="TWsjXbpaznc_" -->
+## Load Data
+<!-- #endregion -->
+
+```{python}
+labeled_df = pd.read_parquet(INPUT_PATH)
+```
+
+```{python}
+print(f'labeled dataframe shape : {labeled_df.shape}')
+labeled_df.head()
+```
+
+```{python}
+ridge_train_df = pd.read_parquet(RIDGE_TRAIN_PATH)
+ridge_test_df = pd.read_parquet(RIDGE_TEST_PATH)
+ridge_df = pd.concat([ridge_train_df, ridge_test_df], axis = 0)
+```
+
+```{python}
+print(f'ridge dataframe shape : {ridge_df.shape}')
+ridge_df.head()
+```
+
+## Add Feature
+
+```{python}
+def feature_engineering(dataset):
+    dataset['Previous_day_demand'] = dataset.groupby(['PULocation', 'DOLocation'])['Demand'].shift(1)
+    dataset['Previous_2day_demand'] = dataset.groupby(['PULocation', 'DOLocation'])['Demand'].shift(2)
+    dataset['Previous_3day_demand'] = dataset.groupby(['PULocation', 'DOLocation'])['Demand'].shift(3)
+    dataset['Previous_4day_demand'] = dataset.groupby(['PULocation', 'DOLocation'])['Demand'].shift(4)
+    dataset['Previous_5day_demand'] = dataset.groupby(['PULocation', 'DOLocation'])['Demand'].shift(5)
+    dataset['Previous_6day_demand'] = dataset.groupby(['PULocation', 'DOLocation'])['Demand'].shift(6)
+    dataset['Previous_week_demand'] = dataset.groupby(['PULocation', 'DOLocation'])['Demand'].shift(7)
+    dataset['Previous_8day_demand'] = dataset.groupby(['PULocation', 'DOLocation'])['Demand'].shift(8)
+    dataset['Previous_9day_demand'] = dataset.groupby(['PULocation', 'DOLocation'])['Demand'].shift(9)
+    dataset['Previous_10day_demand'] = dataset.groupby(['PULocation', 'DOLocation'])['Demand'].shift(10)
+    dataset['Previous_11day_demand'] = dataset.groupby(['PULocation', 'DOLocation'])['Demand'].shift(11)
+    dataset['Previous_12day_demand'] = dataset.groupby(['PULocation', 'DOLocation'])['Demand'].shift(12)
+    dataset['Previous_13day_demand'] = dataset.groupby(['PULocation', 'DOLocation'])['Demand'].shift(13)
+    dataset['Previous_2week_demand'] = dataset.groupby(['PULocation', 'DOLocation'])['Demand'].shift(14)
+
+    dataset['Previous_week_max_demand'] = dataset.groupby(['PULocation', 'DOLocation'])['Demand'].rolling(window=7).max().reset_index(drop = True)
+    dataset['Previous_2week_max_demand'] = dataset.groupby(['PULocation', 'DOLocation'])['Demand'].rolling(window=14).max().reset_index(drop = True)
+
+    dataset['Day_of_week'] = dataset['Date'].dt.dayofweek + 1
+    dataset['Day_of_month'] = dataset['Date'].dt.day
+    
+    dataset = (
+        dataset
+        .merge(ridge_df, how='left', on=['PULocation', 'Date', 'DOLocation'])
+        .rename(columns = {'Predicted_demand' : 'Ridge_predict'})
+        )
+    
+    return dataset
+
+```
+
+```{python}
+features_df = feature_engineering(labeled_df)
+features_df.dropna(inplace = True)
+```
+
+```{python}
+print(f'features dataframe shape : {features_df.shape}')
+features_df.head()
+```
+
+```{python}
+features_df[features_df['Demand'] == 0]
+```
+
+<!-- #region id="zN0kp6jw03DP" -->
+## Split Train and Test Data
+<!-- #endregion -->
+
+```{python id="CMY1G1lmwGmI"}
+def train_test_splitting(dataset, TEST_START_DATE):
+
+    train_df = dataset[dataset['Date'] < TEST_START_DATE]
+    test_df = dataset[dataset['Date'] >= TEST_START_DATE]
+
+    return train_df, test_df
+```
+
+```{python id="3xH4VMGNwGmK"}
+train_df, test_df = train_test_splitting(features_df, TEST_START_DATE)
+```
+
+```{python}
+grid_search_train_df, valid_df = train_test_splitting(train_df, VALIDATION_START_DATE) 
+```
+
+```{python id="xxGdRZfqwGmL"}
+print(f'train dataframe shape : {train_df.shape}')
+train_df.head()
+```
+
+```{python}
+print(f'validation dataframe shape : {valid_df.shape}')
+valid_df.head()
+```
+
+```{python id="uPbINwH224Hy"}
+print(f'test dataframe shape : {test_df.shape}')
+test_df.head()
+```
+
+<!-- #region id="xf8ChW_7wGmL" -->
+# Model Training
+<!-- #endregion -->
+
+<!-- #region id="mIhvw9lH92sa" -->
+## **Gradient Boosting Regressor**
+<!-- #endregion -->
+
+<!-- #region id="13gFIyYfZyxh" -->
+### Model Tuning
+<!-- #endregion -->
+
+```{python}
+def grid_search(model_class, param_grid, train_df, val_df, feature_list):
+    best_params = None
+    best_val_loss = float('inf')
+
+    for params in product(*param_grid.values()):
+        current_params = dict(zip(param_grid.keys(), params))
+        current_model = model_class(**current_params)
+        current_model.fit(train_df[feature_list], train_df['Demand'])
+        
+        y_val_pred = current_model.predict(val_df[feature_list])
+        val_loss = mean_squared_error(val_df['Demand'], y_val_pred)
+        
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_params = current_params
+    
+    return best_params, best_val_loss
+```
+
+```{python}
+if AUTO_TUNE:
+    params_test = {'learning_rate':[0.05, 0.1], 
+                'subsample':[0.8, 0.9], 
+                'colsample_bytree':[0.7, 0.8, 0.9], 
+                'max_depth':[7, 8, 9, 10], 
+                'min_child_weight':[10, 20],
+                'n_estimators':[80, 90, 100]
+                }
+
+    best_params, best_score = grid_search(
+        model_class = xgb.XGBRegressor, 
+        param_grid = params_test,
+        train_df = grid_search_train_df, 
+        val_df = valid_df,
+        feature_list = FEATURE_LIST, 
+        )
+    
+    print(best_params, best_score)
+else:
+    best_params = { 
+        'learning_rate': 0.05, 
+        'subsample': 0.8,
+        'colsample_bytree': 0.8,
+        'max_depth': 10, 
+        'min_child_weight': 20, 
+        'n_estimators': 80
+        }
+```
+
+<!-- #region id="H0IHB8t41NB6" -->
+### Prediction
+<!-- #endregion -->
+
+```{python}
+def model_predict(model, train_data, test_data, feature_list):
+
+    model.fit(train_data[feature_list], train_data['Demand'])
+    train_predict_df = model.predict(train_data[feature_list])
+    test_predict_df = model.predict(test_data[feature_list])
+
+    return train_predict_df, test_predict_df
+```
+
+```{python id="5AdQtdSqN7m9"}
+model = xgb.XGBRegressor(**best_params)
+train_prediction_df, test_prediction_df = model_predict(model, train_df, test_df, FEATURE_LIST)
+```
+
+<!-- #region id="J0EYl9KtTfo7" -->
+### Visualization
+<!-- #endregion -->
+
+```{python id="ao6nw8xsRvB9"}
+def prediction_visualization(train_data, test_data, train_prediction_df, test_prediction_df):
+
+    train_data['Day_of_year'] = train_data['Date'].dt.dayofyear
+    test_data['Day_of_year'] = test_data['Date'].dt.dayofyear
+
+    predicted_train_df = train_data
+    predicted_test_df = test_data
+    predicted_train_df['Predicted'] = train_prediction_df
+    predicted_test_df['Predicted'] = test_prediction_df
+
+    train_data = train_data.groupby('Day_of_year')['Demand'].sum()
+    test_data = test_data.groupby('Day_of_year')['Demand'].sum()
+    predicted_train_df = predicted_train_df.groupby('Day_of_year')['Predicted'].sum()
+    predicted_test_df = predicted_test_df.groupby('Day_of_year')['Predicted'].sum()
+
+    plt.title('Train')
+    plt.plot(train_data)
+    plt.plot(predicted_train_df)
+    plt.legend(["Real Value", "Predicted"], loc ="lower right")
+    plt.show()
+
+    plot_length = len(test_data)
+    plt.title('Test')
+    plt.plot(test_data)
+    plt.plot(predicted_test_df)
+    plt.legend(["Real Value", "Predicted"], loc ="lower right")
+    plt.show()
+```
+
+```{python id="deyLWLmZThMJ", outputId="4d0094aa-099c-490f-aa82-281ee16bae01"}
+prediction_visualization(train_df, test_df, train_prediction_df, test_prediction_df)
+```
+
+<!-- #region id="lERphf0kTist" -->
+### Evaluation
+<!-- #endregion -->
+
+```{python id="BcGvcilUWEEC"}
+def evaluate(metric, metric_name, true_values, predicted_values):
+    print(f'{metric_name} : {metric(true_values, predicted_values)}')
+```
+
+```{python id="v4-GWghuSbnA"}
+def evaluation(model_name, train_df, test_df, train_prediction_df, test_prediction_df):
+    print(f'{model_name} train scores:')
+
+    evaluate(mean_absolute_error, 'MAE', train_df['Demand'], train_prediction_df)
+    evaluate(mean_squared_error, 'MSE', train_df['Demand'], train_prediction_df)
+    evaluate(mean_absolute_percentage_error, 'MAPE', train_df['Demand'], train_prediction_df)
+
+    print(f'\n{model_name} test scores:')
+
+    evaluate(mean_absolute_error, 'MAE', test_df['Demand'], test_prediction_df)
+    evaluate(mean_squared_error, 'MSE', test_df['Demand'], test_prediction_df)
+    evaluate(mean_absolute_percentage_error, 'MAPE', test_df['Demand'], test_prediction_df)
+```
+
+```{python id="qSZwIFprTkqK", outputId="7ae94952-ec22-410a-9d26-6e05a96af6ab"}
+evaluation('XGB', train_df, test_df, train_prediction_df, test_prediction_df)
+```
+
+<!-- #region id="_286hlGi7VWD" -->
+### Feature Importance and SHAPE
+<!-- #endregion -->
+
+```{python id="osueYsNP1NB8", outputId="b3c13ee6-bd74-4470-a8c5-558df5416e28"}
+xgb.plot_importance(model)
+plt.show()
+```
+
+```{python id="50CEqbp75Y_i", outputId="b7288f1d-517a-4707-da22-ad996453f161"}
+'''dtrain_reg = xgb.DMatrix(train_df[FEATURE_LIST].values, train_df['Demand'].values, enable_categorical=True)
+
+explainer = shap.TreeExplainer(model)
+shap_values = explainer.shap_values(dtrain_reg)
+shap.summary_plot(shap_values, train_df[FEATURE_LIST])'''
+```
+
+# File Saving
+
+```{python}
+def save_predictions(dataset, path):
+    dataset.to_parquet(path, index=False)
+```
+
+```{python}
+def prediction_labeling(pred_df, labeled_df):
+    pred_df = pd.DataFrame(pred_df, columns = ['Predicted_demand'])
+    labeled_df.reset_index(inplace = True)
+    labeled_prediction_df = labeled_df[['PULocation', 'Date', 'DOLocation']]
+    labeled_prediction_df['Predicted_demand'] = pred_df
+    return labeled_prediction_df
+```
+
+```{python}
+labeled_prediction_df = prediction_labeling(test_prediction_df, test_df)
+```
+
+```{python}
+print(f'labeled prediction dataframe shape : {labeled_prediction_df.shape}')
+labeled_prediction_df.head()
+```
+
+```{python}
+save_predictions(labeled_prediction_df, OUTPUT_PATH)
+```

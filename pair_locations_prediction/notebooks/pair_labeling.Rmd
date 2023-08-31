@@ -1,0 +1,154 @@
+---
+jupyter:
+  jupytext:
+    text_representation:
+      extension: .Rmd
+      format_name: rmarkdown
+      format_version: '1.2'
+      jupytext_version: 1.14.7
+  kernelspec:
+    display_name: Python 3
+    language: python
+    name: python3
+---
+
+# Imports
+
+```{python}
+import datetime
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+```
+
+# Config
+
+```{python}
+INPUT_PATH = 'ride_data/'
+OUTPUT_PATH = 'data/pair_labels.parquet'
+START_DATE = '2023-01-01'
+END_DATE = '2023-04-30'
+```
+
+# Loading Dataset
+
+```{python}
+def load_data(path, start_date: str, end_date: str):
+    df = pd.read_parquet(path) 
+    start_date = datetime.date.fromisoformat(start_date)
+    end_date = datetime.date.fromisoformat(end_date)
+    filtered_df = df[(df['tpep_pickup_datetime'].dt.date >= start_date) &
+                     (df['tpep_pickup_datetime'].dt.date <= end_date)]
+    dataset = filtered_df.filter(items=['tpep_pickup_datetime', 'PULocationID', 'DOLocationID'])
+    dataset['PU_date'] = pd.to_datetime(dataset['tpep_pickup_datetime'].dt.date)
+    return dataset
+```
+
+```{python}
+rides_df = load_data(INPUT_PATH, START_DATE, END_DATE)
+print(f'rides_df shape : {rides_df.shape}')
+rides_df.head()
+```
+
+# Labeling
+
+```{python}
+def labeling(dataset):
+    dataset_labels = (
+        dataset
+        .groupby(['PULocationID', 'DOLocationID', 'PU_date'])['PU_date']
+        .count()
+        .to_frame('Demand')
+        .sort_values(['PULocationID', 'DOLocationID', 'PU_date'], ascending=[True, True, True])
+        .reset_index()
+        .rename(columns={'PULocationID': 'PULocation', 'DOLocationID': 'DOLocation', 'PU_date': 'Date'})
+    )
+  
+    pu_locations = pd.DataFrame(dataset_labels['PULocation'].unique(), columns=['PULocation'])
+    do_locations = pd.DataFrame(dataset_labels['DOLocation'].unique(), columns=['DOLocation'])
+    dates = pd.DataFrame(dataset_labels['Date'].unique(), columns=['Date'])
+    
+    location_date_df = (
+        pu_locations
+        .merge(dates, how='cross')
+        .merge(do_locations, how = 'cross')
+        .sort_values(['PULocation', 'DOLocation', 'Date'], ascending=[True, True, True])
+        .reset_index(drop=True)
+    )
+    
+    labels_df = (
+        location_date_df
+        .merge(dataset_labels, how='left', on=['PULocation', 'DOLocation', 'Date'])
+        .fillna(value=0)
+    )
+    
+    return labels_df
+```
+
+```{python}
+labels_df = labeling(rides_df)
+print(f'labels_df shape : {labels_df.shape}')
+labels_df.head()
+```
+
+```{python}
+mean_labeled_df = (labels_df.groupby(['PULocation', 'DOLocation'], as_index=False)['Demand']
+                   .mean().sort_values('Demand', ascending=False)
+                   .reset_index(drop=True))
+```
+
+```{python}
+def plot_cumsum_demand(labeled_df, target_demand):
+    grouped_df = (labeled_df.groupby(['PULocation', 'DOLocation'], as_index=False)['Demand']
+                  .sum().reset_index().sort_values(by='Demand', ascending=False).reset_index(drop=True))
+    cumulative_demand = (grouped_df['Demand'].cumsum() / grouped_df['Demand'].sum()).to_numpy()
+    
+    plt.plot(range(0,len(cumulative_demand)), cumulative_demand)
+    plt.xlabel('Location numbers')
+    plt.ylabel('Cumulative Demand')
+    plt.title('Cumulative Demand by Location')
+    target_x = (cumulative_demand <= target_demand).argmin()
+    plt.axhline(y=target_demand, color='r', linestyle='--', label=f'Target Demand ({target_demand})')
+    plt.axvline(x=target_x, color='g', linestyle='--', label=f'Target Location ({target_x})')
+    important_pairs = grouped_df.iloc[:target_x][['PULocation', 'DOLocation']]
+    
+    plt.legend() 
+    plt.show()
+    return target_x, important_pairs
+```
+
+```{python}
+last_pair_index, important_pairs = plot_cumsum_demand(labels_df, 0.8)
+```
+
+```{python}
+pair_labels = np.concatenate((np.ones(last_pair_index), np.zeros(len(mean_labeled_df) - last_pair_index)))
+plt.scatter(range(len(mean_labeled_df['Demand'].values)), mean_labeled_df['Demand'].values, c = pair_labels)
+plt.xlabel('Location pair number')
+plt.ylabel('Mean of pair demand')
+plt.show()
+```
+
+```{python}
+merged_df = pd.merge(labels_df, important_pairs, on=['PULocation', 'DOLocation'], how='inner')
+```
+
+```{python}
+print(f'labels_df shape : {merged_df.shape}')
+merged_df.head()
+```
+
+```{python}
+merged_df[merged_df['Demand'] == 0]
+```
+
+# File saving
+
+```{python}
+def save_labels(dataset, path):
+    labels_df = dataset.to_parquet(path, index=False)
+```
+
+```{python}
+save_labels(merged_df, OUTPUT_PATH)
+```
